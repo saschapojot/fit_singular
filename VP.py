@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import roots_laguerre
-from scipy.optimize import lsq_linear
+from scipy.optimize import least_squares, lsq_linear
 from scipy.linalg import cholesky, solve_triangular
 
 
@@ -20,125 +20,127 @@ def true_second_derivative(x, xc, gamma):
     return gamma * (gamma + 1) * (xc - x) ** (-(gamma + 2))
 
 
-def test_derivative_ratio_fit():
+def test_varpro_derivative_ratio_fit():
     # --- 1. Define true parameters and generate synthetic data ---
     xc_true = 5.0
-    gamma_true =3
+    gamma_true = 2.1
     c_true = 2.0
 
-    x0 = 4.2
-    x_end = 4.6
-    M =30
+    x0 =4.2
+    x_end = 4.8
+    M = 50
     x_m = np.linspace(x0, x_end, M)
     dx = x_m[1] - x_m[0]
-    noise_std = 0.1
 
-    m_indices = np.arange(M)
-    x_m = x0 + m_indices * dx
+    noise_std = 0.1
 
     # Generate noisy data
     np.random.seed(42)
     F_true = true_function(x_m, xc_true, gamma_true, c_true)
     F_noisy = F_true + np.random.normal(0, noise_std, size=M)
 
-    # True derivatives for comparison
     F_prime_true = true_first_derivative(x_m, xc_true, gamma_true)
     F_double_prime_true = true_second_derivative(x_m, xc_true, gamma_true)
 
-    # --- 2. Set up the Laguerre Quadrature ---
-    n = 10
-    t_j, _ = roots_laguerre(n)
-
-    # --- 3. Construct the Differenced Data and Design Matrix ---
-    # d_m = f_{m+1} - f_m
+    # --- 2. Construct Differenced Data and Whiten ---
     d = F_noisy[1:] - F_noisy[:-1]
 
-    # G_diff[m, j] = exp(t_j * m * dx) * (exp(t_j * dx) - 1)
-    G_diff = np.zeros((M - 1, n))
-    for j in range(n):
-        m_diff_indices = np.arange(M - 1)
-        G_diff[:, j] = np.exp(t_j[j] * m_diff_indices * dx) * (np.exp(t_j[j] * dx) - 1.0)
-
-    # --- 4. Whiten the Data (Generalized Least Squares) ---
     # Covariance matrix V for differenced i.i.d noise (MA(1) process)
     V = np.diag(np.full(M - 1, 2.0)) + \
         np.diag(np.full(M - 2, -1.0), k=1) + \
         np.diag(np.full(M - 2, -1.0), k=-1)
 
-    # Cholesky decomposition: V = L * L^T
     L = cholesky(V, lower=True)
-
-    # Whiten the data and design matrix: L * x = b => x = L^{-1} * b
     d_tilde = solve_triangular(L, d, lower=True)
-    G_tilde = solve_triangular(L, G_diff, lower=True)
 
-    # --- 5. Solve the linear system with Non-Negative Constraints ---
-    lower_bounds = [0.0] * n
-    upper_bounds = [np.inf] * n
-    res = lsq_linear(G_tilde, d_tilde, bounds=(lower_bounds, upper_bounds))
-    a_fit = res.x
+    # --- 3. VARIABLE PROJECTION (Golub-Pereyra) ---
+    n = 5  # We can use fewer terms now because they are optimized!
+    t_initial, _ = roots_laguerre(n)
+    m_diff_indices = np.arange(M - 1)
 
-    # --- 6. Compute Analytical Derivatives f' and f'' ---
-    # Transform coefficients: w_j = a_j * exp(-t_j * x0)
-    w_tilde = a_fit * np.exp(-t_j * x0)
+    def varpro_residual(t_params):
+        """
+        Given nonlinear parameters t_params, project out the linear parameters a,
+        and return the whitened residual.
+        """
+        # Construct Design Matrix for current t_params
+        G_diff = np.zeros((M - 1, n))
+        for j in range(n):
+            G_diff[:, j] = np.exp(t_params[j] * m_diff_indices * dx) * (np.exp(t_params[j] * dx) - 1.0)
+
+        # Whiten Design Matrix
+        G_tilde = solve_triangular(L, G_diff, lower=True)
+
+        # Project out linear parameters 'a' using Non-Negative Least Squares
+        # (This is a constrained variation of standard VarPro)
+        res_linear = lsq_linear(G_tilde, d_tilde, bounds=(0.0, np.inf))
+        a_opt = res_linear.x
+
+        # Compute and return the residual vector
+        residual = d_tilde - G_tilde @ a_opt
+        return residual
+
+    # Optimize the nonlinear exponents (t_j)
+    # We constrain t_j > 0 to ensure they represent growing exponentials towards the singularity
+    # New code with a safe upper bound to prevent exponential overflow
+    res_nonlin = least_squares(varpro_residual, t_initial, bounds=(0.0, 200.0), method='trf')
+    t_opt = res_nonlin.x
+
+    # --- 4. Extract Final Linear Parameters ---
+    # Now that we have the optimal t_j, we do one final linear solve to get the optimal a_j
+    G_diff_opt = np.zeros((M - 1, n))
+    for j in range(n):
+        G_diff_opt[:, j] = np.exp(t_opt[j] * m_diff_indices * dx) * (np.exp(t_opt[j] * dx) - 1.0)
+
+    G_tilde_opt = solve_triangular(L, G_diff_opt, lower=True)
+    a_opt = lsq_linear(G_tilde_opt, d_tilde, bounds=(0.0, np.inf)).x
+
+    # --- 5. Compute Analytical Derivatives f' and f'' ---
+    w_tilde = a_opt * np.exp(-t_opt * x0)
 
     F_prime_fit = np.zeros(M)
     F_double_prime_fit = np.zeros(M)
 
     for j in range(n):
-        # f'(x) = sum w_j * t_j * exp(t_j * x)
-        F_prime_fit += w_tilde[j] * t_j[j] * np.exp(t_j[j] * x_m)
-        # f''(x) = sum w_j * t_j^2 * exp(t_j * x)
-        F_double_prime_fit += w_tilde[j] * (t_j[j] ** 2) * np.exp(t_j[j] * x_m)
+        F_prime_fit += w_tilde[j] * t_opt[j] * np.exp(t_opt[j] * x_m)
+        F_double_prime_fit += w_tilde[j] * (t_opt[j] ** 2) * np.exp(t_opt[j] * x_m)
 
-    # --- 7. Infer xc and gamma using the ratio f'/f'' ---
-    # Ratio: f'/f'' = (xc - x) / (gamma + 1) = (-1 / (gamma + 1)) * x + (xc / (gamma + 1))
+    # --- 6. Infer xc and gamma using the ratio f'/f'' ---
     ratio_fit = F_prime_fit / F_double_prime_fit
 
-    # Use the last few points where the singularity dominates the behavior
-    num_points_fit = 6
+    num_points_fit = 15
     x_m_reg = x_m[-num_points_fit:]
     ratio_reg = ratio_fit[-num_points_fit:]
 
-    # Linear regression: y = mx + b
     m_line, b_line = np.polyfit(x_m_reg, ratio_reg, 1)
 
-    # Extract parameters
-    # m = -1 / (gamma + 1)  =>  gamma = -1/m - 1
     gamma_inferred = (-1.0 / m_line) - 1.0
-
-    # b = xc / (gamma + 1)  =>  xc = b * (gamma + 1) = -b / m
     xc_inferred = -b_line / m_line
 
-    # --- 8. Print Results ---
-    print("-" * 40)
-    print("Inferred Critical Parameters (from f'/f'' ratio):")
+    # --- 7. Print Results ---
+    print("-" * 50)
+    print("Inferred Critical Parameters (VarPro Method):")
     print(f"True gamma: {gamma_true:.4f}  |  Inferred gamma: {gamma_inferred:.4f}")
     print(f"True xc:    {xc_true:.4f}  |  Inferred xc:    {xc_inferred:.4f}")
-    print("-" * 40)
+    print("-" * 50)
 
-    # --- 9. Plotting ---
+    # --- 8. Plotting ---
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
-    # Plot 1: First Derivative
     ax1.plot(x_m, F_prime_true, 'b-', label="True $f'(x)$", alpha=0.6)
     ax1.plot(x_m, F_prime_fit, 'r--', label="Fitted $f'(x)$", linewidth=2)
     ax1.set_title("First Derivative: $f'(x)$")
     ax1.legend()
     ax1.grid(True)
 
-    # Plot 2: Second Derivative
     ax2.plot(x_m, F_double_prime_true, 'b-', label="True $f''(x)$", alpha=0.6)
     ax2.plot(x_m, F_double_prime_fit, 'g--', label="Fitted $f''(x)$", linewidth=2)
     ax2.set_title("Second Derivative: $f''(x)$")
     ax2.legend()
     ax2.grid(True)
 
-    # Plot 3: Ratio and Regression
     ax3.plot(x_m, ratio_fit, 'mo', label='All Ratio Data', markersize=5, alpha=0.4)
     ax3.plot(x_m_reg, ratio_reg, 'co', label=f'Regression Pts (Last {num_points_fit})', markersize=7)
-
-    # Plot the regression line extended across the domain
     ax3.plot(x_m, m_line * x_m + b_line, 'k-', label='Linear Regression', linewidth=2)
     ax3.set_title(r"Ratio: $\frac{f'(x)}{f''(x)} = \frac{x_c - x}{\gamma + 1}$")
 
@@ -152,9 +154,9 @@ def test_derivative_ratio_fit():
     ax3.grid(True)
 
     plt.tight_layout()
-    plt.savefig("2nd.png")
+    plt.savefig("vp.png")
     plt.close()
 
 
-
-test_derivative_ratio_fit()
+if __name__ == "__main__":
+    test_varpro_derivative_ratio_fit()
